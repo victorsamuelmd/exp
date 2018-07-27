@@ -1,61 +1,46 @@
 package main
 
 import (
-	"crypto/md5"
+	"crypto/rand"
+	"crypto/rsa"
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"strings"
-	"time"
 
-	val "github.com/go-ozzo/ozzo-validation"
+	"golang.org/x/crypto/bcrypt"
 
-	_ "github.com/go-sql-driver/mysql"
+	jwt "github.com/dgrijalva/jwt-go"
+	"github.com/gorilla/mux"
+	_ "github.com/lib/pq"
 	"github.com/satori/go.uuid"
 )
 
+var secretKey, _ = rsa.GenerateKey(rand.Reader, 1024)
+
 // import "encoding/json"
 
-type DbUser struct {
-	Username   string    `json:"userName"`
-	Password   string    `json:"password"`
-	Email      string    `json:"email"`
-	FirstName  string    `json:"firstName"`
-	SecondName string    `json:"secondName"`
-	LastDate   time.Time `json:"lastDate"`
-}
+// NewDBConn creates a connextion to a mysql server
+func NewDBConn() DBConn {
 
-type Server struct {
-	DB *sql.DB
-}
+	password := "NataliaVictor12122801"
+	dbUsername := "victorsamuelmd"
+	dbName := "node"
+	connStr := fmt.Sprintf("user=%s password=%s dbname=%s sslmode=disable",
+		dbUsername, password, dbName)
 
-// NewServer creates a connextion to a mysql server
-func NewServer() Server {
-
-	password := "74bc5df74572aaa50b5f2a6bb7fa020ec43c2ecb35d2be39699095ec0a79"
-	dbUsername := "root"
-	dbHost := "opuslibertati"
-
-	db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@/%s", dbUsername, password, dbHost))
+	db, err := sql.Open("postgres", connStr)
 
 	if err != nil {
 		panic(err)
 	}
 
-	return Server{db}
+	return DBConn{db}
 }
 
-// Credentials struct for passing out values
-type Credentials struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-	Grupo    int    `json:"grupo"`
-}
-
-func (s Server) autenticarUsuario(w http.ResponseWriter, r *http.Request) {
+func (s DBConn) autenticarUsuario(w http.ResponseWriter, r *http.Request) {
 	var decoder = json.NewDecoder(r.Body)
+	defer r.Body.Close()
 	var encoder = json.NewEncoder(w)
 	var jsonRequest Credentials
 	var err error
@@ -66,81 +51,81 @@ func (s Server) autenticarUsuario(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h := md5.New()
-	io.WriteString(h, jsonRequest.Password)
-	jsonRequest.Password = fmt.Sprintf("%x", h.Sum(nil))
-
 	sqlStmt, err := s.DB.
-		Prepare("select username, passwd, id_grupo from d9_users where username=? and passwd=?")
-	result := sqlStmt.QueryRow(jsonRequest.Username, jsonRequest.Password)
+		Prepare(`SELECT usuario, palabra_clave, grupo
+			FROM usuarios
+			WHERE usuario = $1`)
+	result := sqlStmt.QueryRow(jsonRequest.Username)
 
-	err = result.Scan(&jsonRequest.Username, &jsonRequest.Password, &jsonRequest.Grupo)
+	var pass []byte
+	var grupo string
+
+	err = result.Scan(&jsonRequest.Username, &pass, &grupo)
 	if err == sql.ErrNoRows {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		http.Error(w, "Bad Credentials", http.StatusNotFound)
 		return
 	}
 
-	encoder.Encode(jsonRequest)
-
-}
-
-// Usuario es una estructura para pasar usuarios para crearlos
-type Usuario struct {
-	ID              string `json:"id"`
-	Nombres         string `json:"nombres"`
-	Apellidos       string `json:"apellidos"`
-	Grupo           string `json:"grupo"`
-	Empresa         string `json:"empresa"`
-	UsuarioNombre   string `json:"usuario"`
-	DocumentoNumero string `json:"documentoNumero"`
-}
-
-// Validate valida los datos del Usuario
-func (u Usuario) Validate() error {
-	return val.ValidateStruct(&u,
-		val.Field(&u.Apellidos, val.Required, val.Length(2, 255)),
-		val.Field(&u.Nombres, val.Required, val.Length(2, 255)),
-		val.Field(&u.Grupo, val.Required, val.Length(2, 20)),
-		val.Field(&u.Empresa, val.Required, val.Length(2, 20)),
-		val.Field(&u.UsuarioNombre, val.Required, val.Length(2, 60)),
-		val.Field(&u.DocumentoNumero, val.Required, val.Length(4, 15)))
-}
-
-func (s Server) crearUsuario(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Only POST request", http.StatusBadRequest)
+	err = bcrypt.CompareHashAndPassword(pass, []byte(jsonRequest.Password))
+	if err != nil {
+		http.Error(w, "Bad Credentials", http.StatusNotFound)
 		return
 	}
 
-	var user Usuario
+	tokenString, err := createToken(jsonRequest.Username, jsonRequest.Grupo)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	encoder.Encode(map[string]interface{}{
+		"username":      jsonRequest.Username,
+		"authorization": tokenString,
+		"grupo":         grupo})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+}
+
+func (s DBConn) crearUsuario(w http.ResponseWriter, r *http.Request) {
+
+	var usr Usuario
 
 	decoder := json.NewDecoder(r.Body)
-	decoder.Decode(&user)
-	err := user.Validate()
+	defer r.Body.Close()
+	decoder.Decode(&usr)
+	err := usr.Validate()
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Something went wrong: %s", err), http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	stmt := `insert into d9_users
-	(id, username, id_grupo, id_empresa, p_nombre, p_apellido, documento_numero)
-	values (?, ?, ?, ?, ?, ?, ?)`
+	hashPalabraClave, err := bcrypt.GenerateFromPassword([]byte(usr.PalabraClave), 4)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	usr.PalabraClave = string(hashPalabraClave)
+	stmt := `insert into usuarios
+		(id, usuario, palabra_clave, correo_electronico, grupo)
+		values ($1, $2, $3, $4, $5)`
 
 	u2, err := uuid.NewV4()
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Something went wrong: %s", err), http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	sqlStmt, err := s.DB.Prepare(stmt)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Something went wrong: %s", err), http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	_, err = sqlStmt.Exec(u2, user.UsuarioNombre,
-		user.Grupo, user.Empresa, user.Nombres, user.Apellidos, user.DocumentoNumero)
+	_, err = sqlStmt.Exec(u2, usr.UsuarioNombre, usr.PalabraClave,
+		usr.CorreoElectronico, usr.Grupo)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Something went wrong: %s", err), http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -148,52 +133,44 @@ func (s Server) crearUsuario(w http.ResponseWriter, r *http.Request) {
 	encoder.Encode(u2.String())
 }
 
-func (s Server) obtenerUsuario(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Only GET request Allowed", http.StatusBadRequest)
-		return
-	}
+func (s DBConn) obtenerUsuario(w http.ResponseWriter, r *http.Request) {
 
-	q := r.URL.Query()
-	if q.Get("id") == "" {
-		http.Error(w, "Id query value missing", http.StatusBadRequest)
-		return
-	}
+	vars := mux.Vars(r)
 
-	slqStmt := `select id, username, p_nombre, p_apellido, documento_numero from d9_users where id = ?`
-	row := s.DB.QueryRow(slqStmt, q.Get("id"))
+	slqStmt := `SELECT id, usuario, correo_electronico, fecha_creacion FROM usuarios WHERE id = $1`
+	row := s.DB.QueryRow(slqStmt, vars["id"])
 
-	var u Usuario
+	var usr Usuario
 
-	err := row.Scan(&u.ID, &u.UsuarioNombre, &u.Nombres, &u.Apellidos, &u.DocumentoNumero)
+	err := row.Scan(&usr.ID, &usr.UsuarioNombre, &usr.CorreoElectronico, &usr.FechaCreacion)
 
 	if err == sql.ErrNoRows {
-		http.Error(w, fmt.Sprintf("User with id: %s not found", q.Get("id")), http.StatusNotFound)
+		http.Error(w, fmt.Sprintf("User with id: %s not found", vars["id"]), http.StatusNotFound)
 		return
 	}
+
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error: %s", err.Error()), http.StatusInternalServerError)
+		return
+	}
+
 	encoder := json.NewEncoder(w)
-	if err = encoder.Encode(u); err != nil {
+	if err = encoder.Encode(usr); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 
 }
 
-func (s Server) buscarUsuario(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Only GET request Allowed", http.StatusBadRequest)
-		return
-	}
+func (s DBConn) buscarUsuario(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	rows, err := s.DB.Query(`SELECT
-		id, username, p_nombre, p_apellido, documento_numero
-		FROM d9_users
-		WHERE p_nombre LIKE ?
-		AND p_apellido LIKE ?
-		AND documento_numero LIKE ?`,
+		id, usuario, correo_electronico
+		FROM usuarios
+		WHERE usuario LIKE $1
+		AND correo_electronico LIKE $2`,
 
-		fmt.Sprintf("%%%s%%", q.Get("nombre")),
-		fmt.Sprintf("%%%s%%", q.Get("apellido")),
-		fmt.Sprintf("%%%s%%", q.Get("documento")))
+		fmt.Sprintf("%%%s%%", q.Get("nombres")),
+		fmt.Sprintf("%%%s%%", q.Get("correo_electronico")))
 
 	defer rows.Close()
 	if err != nil {
@@ -205,7 +182,7 @@ func (s Server) buscarUsuario(w http.ResponseWriter, r *http.Request) {
 
 	for rows.Next() {
 		var user Usuario
-		rows.Scan(&user.ID, &user.UsuarioNombre, &user.Nombres, &user.Apellidos, &user.DocumentoNumero)
+		rows.Scan(&user.ID, &user.UsuarioNombre, &user.CorreoElectronico)
 		users = append(users, user)
 	}
 	rows.Close()
@@ -224,49 +201,63 @@ func (s Server) buscarUsuario(w http.ResponseWriter, r *http.Request) {
 
 }
 
-func (s Server) actualizarUsuario(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPut {
-		http.Error(w, "Only PUT allowed", http.StatusBadRequest)
-		return
-	}
-	sqlStmt := `UPDATE d9_users
-		SET %s
-		WHERE id = ?`
+func (s DBConn) buscarPerfiles(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	rows, err := s.DB.Query(`SELECT
+		id, nombres, apellidos, documento_numero, fecha_nacimiento
+		FROM perfiles
+		WHERE nombres LIKE $1
+		AND apellidos LIKE $2`,
 
-	var canBeUpdated = func(field string) bool {
-		switch field {
-		case
-			"id",
-			"p_apellido",
-			"p_nombre",
-			"numero_documento",
-			"empresa":
-			return true
-		}
-		return false
-	}
+		fmt.Sprintf("%%%s%%", q.Get("nombres")),
+		fmt.Sprintf("%%%s%%", q.Get("apellidos")))
 
-	var req map[string]string
-	var fieldsToUpdate []string
-	var toUpdate []interface{}
-	err := json.NewDecoder(r.Body).Decode(&req)
-
-	for k, v := range req {
-		if canBeUpdated(k) {
-			fieldsToUpdate = append(fieldsToUpdate, fmt.Sprintf(`%s=?`, k))
-			toUpdate = append(toUpdate, v)
-		}
-	}
-	// id is the last argument
-	toUpdate = append(toUpdate, req["id"])
-
-	prepStmt := fmt.Sprintf(sqlStmt, strings.Join(fieldsToUpdate, ","))
-	stmt, err := s.DB.Prepare(prepStmt)
+	defer rows.Close()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	res, err := stmt.Exec(toUpdate...)
+
+	var prf []Perfil
+
+	for rows.Next() {
+		var p Perfil
+		rows.Scan(&p.ID, &p.Nombres, &p.Apellidos, &p.DocumentoNumero, &p.FechaNacimiento)
+		prf = append(prf, p)
+	}
+	rows.Close()
+
+	if len(prf) == 0 {
+		http.Error(w, "No hay usuarios", http.StatusNotFound)
+		return
+	}
+
+	encoder := json.NewEncoder(w)
+	err = encoder.Encode(prf)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+}
+
+func (s DBConn) actualizarUsuario(w http.ResponseWriter, r *http.Request) {
+	sqlStmt := `UPDATE usuarios
+		SET correo_electronico = $1
+		WHERE id = $2`
+
+	var req map[string]string
+	err := json.NewDecoder(r.Body).Decode(&req)
+
+	vars := mux.Vars(r)
+
+	stmt, err := s.DB.Prepare(sqlStmt)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	res, err := stmt.Exec(req["correoElectronico"], vars["id"])
+	fmt.Print(vars["id"])
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -279,7 +270,7 @@ func (s Server) actualizarUsuario(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	fmt.Fprint(w, "success")
+	fmt.Fprint(w, "success", rows)
 }
 
 func activateCors(f http.HandlerFunc) http.HandlerFunc {
@@ -287,7 +278,7 @@ func activateCors(f http.HandlerFunc) http.HandlerFunc {
 		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, PUT, GET")
 		w.Header().Set("Access-Control-Allow-Headers", "content-type, authorization")
-		w.Header().Set(`Content-Type`, `application/json`)
+		w.Header().Set("Content-Type", "application/json")
 		if r.Method == http.MethodOptions {
 			return
 		}
@@ -295,15 +286,65 @@ func activateCors(f http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func main() {
-	server := NewServer()
-	defer server.DB.Close()
+func protect(f http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := r.Header.Get("Authorization")
+		if ok := validateToken(token); !ok {
+			http.Error(w, "Unautho", http.StatusUnauthorized)
+			return
+		}
+		f.ServeHTTP(w, r)
+	}
+}
 
-	w := http.NewServeMux()
-	w.HandleFunc("/login", activateCors(server.autenticarUsuario))
-	w.HandleFunc("/nuevousuario", activateCors(server.crearUsuario))
-	w.HandleFunc("/obtenerusuario", activateCors(server.obtenerUsuario))
-	w.HandleFunc("/buscarusuario", activateCors(server.buscarUsuario))
-	w.HandleFunc("/actualizarusuario", activateCors(server.actualizarUsuario))
-	http.ListenAndServe(":8070", w)
+func validateToken(token string) bool {
+	if _, err := jwt.Parse(token, func(t *jwt.Token) (interface{}, error) {
+		return secretKey.Public(), nil
+	}); err != nil {
+		return false
+	}
+	return true
+}
+
+func createToken(username, authLevel string) (string, error) {
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
+		"usuario": username,
+		"grupo":   authLevel,
+	})
+
+	return token.SignedString(secretKey)
+}
+
+func main() {
+
+	dbConn := NewDBConn()
+	defer dbConn.DB.Close()
+	r := Router(dbConn)
+	http.ListenAndServe(":8070", r)
+
+}
+
+// Router es la funcion que crea un manejador, necesario para las pruebas
+func Router(dbConn DBConn) *mux.Router {
+
+	w := mux.NewRouter()
+
+	w.HandleFunc("/login", activateCors(dbConn.autenticarUsuario)).
+		Methods(http.MethodPost, http.MethodOptions)
+
+	w.HandleFunc("/usuarios", activateCors(dbConn.crearUsuario)).
+		Methods(http.MethodPost, http.MethodOptions)
+
+	w.HandleFunc("/usuarios", activateCors(dbConn.buscarUsuario)).
+		Methods(http.MethodGet, http.MethodOptions)
+
+	w.HandleFunc("/usuarios/{id}", activateCors(dbConn.obtenerUsuario)).
+		Methods(http.MethodGet, http.MethodOptions)
+
+	w.HandleFunc("/usuarios/{id}", activateCors(dbConn.actualizarUsuario)).
+		Methods(http.MethodPut, http.MethodOptions)
+
+	w.HandleFunc("/perfiles", activateCors(dbConn.buscarPerfiles)).
+		Methods(http.MethodGet, http.MethodOptions)
+	return w
 }
