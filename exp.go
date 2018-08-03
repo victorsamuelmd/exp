@@ -3,39 +3,36 @@ package main
 import (
 	"crypto/rand"
 	"crypto/rsa"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
+	"github.com/globalsign/mgo"
 	"golang.org/x/crypto/bcrypt"
 
 	jwt "github.com/dgrijalva/jwt-go"
+	"github.com/globalsign/mgo/bson"
 	"github.com/gorilla/mux"
-	_ "github.com/lib/pq"
-	"github.com/satori/go.uuid"
 )
 
 var secretKey, _ = rsa.GenerateKey(rand.Reader, 1024)
 
-// import "encoding/json"
+const dbName = "mednote"
+const perfilesC = "perfiles"
+const usuariosC = "usuarios"
+const historiaUrgenciasC = "historiaUrgencias"
 
 // NewDBConn creates a connextion to a mysql server
 func NewDBConn() DBConn {
 
-	password := "NataliaVictor12122801"
-	dbUsername := "victorsamuelmd"
-	dbName := "node"
-	connStr := fmt.Sprintf("user=%s password=%s dbname=%s sslmode=disable",
-		dbUsername, password, dbName)
-
-	db, err := sql.Open("postgres", connStr)
+	mdb, err := mgo.Dial(`root:example@localhost`)
 
 	if err != nil {
 		panic(err)
 	}
 
-	return DBConn{db}
+	return DBConn{mdb}
 }
 
 func (s DBConn) autenticarUsuario(w http.ResponseWriter, r *http.Request) {
@@ -50,37 +47,34 @@ func (s DBConn) autenticarUsuario(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	var usr Usuario
 
-	sqlStmt, err := s.DB.
-		Prepare(`SELECT usuario, palabra_clave, grupo
-			FROM usuarios
-			WHERE usuario = $1`)
-	result := sqlStmt.QueryRow(jsonRequest.Username)
+	ss := s.MDB.Copy()
+	defer ss.Close()
 
-	var pass []byte
-	var grupo string
+	err = ss.DB(dbName).C(usuariosC).
+		Find(bson.M{"usuario": jsonRequest.Username}).One(&usr)
 
-	err = result.Scan(&jsonRequest.Username, &pass, &grupo)
-	if err == sql.ErrNoRows {
-		http.Error(w, "Bad Credentials", http.StatusNotFound)
-		return
-	}
-
-	err = bcrypt.CompareHashAndPassword(pass, []byte(jsonRequest.Password))
 	if err != nil {
-		http.Error(w, "Bad Credentials", http.StatusNotFound)
+		http.Error(w, "Unauthorized", http.StatusBadRequest)
 		return
 	}
 
-	tokenString, err := createToken(jsonRequest.Username, jsonRequest.Grupo)
+	err = bcrypt.CompareHashAndPassword([]byte(usr.PalabraClave), []byte(jsonRequest.Password))
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusNotFound)
+		return
+	}
+
+	tokenString, err := createToken(usr.UsuarioNombre, usr.Grupo)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	encoder.Encode(map[string]interface{}{
-		"username":      jsonRequest.Username,
+		"username":      usr.UsuarioNombre,
 		"authorization": tokenString,
-		"grupo":         grupo})
+		"grupo":         usr.Grupo})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -94,58 +88,47 @@ func (s DBConn) crearUsuario(w http.ResponseWriter, r *http.Request) {
 
 	decoder := json.NewDecoder(r.Body)
 	defer r.Body.Close()
+
 	decoder.Decode(&usr)
+
 	err := usr.Validate()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	hashPalabraClave, err := bcrypt.GenerateFromPassword([]byte(usr.PalabraClave), 4)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	usr.PalabraClave = string(hashPalabraClave)
-	stmt := `insert into usuarios
-		(id, usuario, palabra_clave, correo_electronico, grupo)
-		values ($1, $2, $3, $4, $5)`
-
-	u2, err := uuid.NewV4()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		js, _ := json.Marshal(map[string]interface{}{"errors": err.Error()})
+		http.Error(w, string(js), http.StatusBadRequest)
 		return
 	}
 
-	sqlStmt, err := s.DB.Prepare(stmt)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	ss := s.MDB.Copy()
+	defer ss.Close()
 
-	_, err = sqlStmt.Exec(u2, usr.UsuarioNombre, usr.PalabraClave,
-		usr.CorreoElectronico, usr.Grupo)
+	id, err := usr.Save(ss)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		js, _ := json.Marshal(map[string]interface{}{"errors": err.Error()})
+		http.Error(w, string(js), http.StatusBadRequest)
 		return
 	}
 
 	encoder := json.NewEncoder(w)
-	encoder.Encode(u2.String())
+	encoder.Encode(id)
 }
 
 func (s DBConn) obtenerUsuario(w http.ResponseWriter, r *http.Request) {
 
 	vars := mux.Vars(r)
 
-	slqStmt := `SELECT id, usuario, correo_electronico, fecha_creacion FROM usuarios WHERE id = $1`
-	row := s.DB.QueryRow(slqStmt, vars["id"])
-
 	var usr Usuario
+	ss := s.MDB.Clone()
+	defer ss.Close()
 
-	err := row.Scan(&usr.ID, &usr.UsuarioNombre, &usr.CorreoElectronico, &usr.FechaCreacion)
+	if !bson.IsObjectIdHex(vars["id"]) {
+		http.Error(w, "Id should be a valid Hex", http.StatusBadRequest)
+		return
+	}
 
-	if err == sql.ErrNoRows {
-		http.Error(w, fmt.Sprintf("User with id: %s not found", vars["id"]), http.StatusNotFound)
+	err := ss.DB(dbName).C(usuariosC).FindId(bson.ObjectIdHex(vars["id"])).One(&usr)
+
+	if err == mgo.ErrNotFound {
+		http.Error(w, "Not Found", http.StatusNotFound)
 		return
 	}
 
@@ -162,74 +145,40 @@ func (s DBConn) obtenerUsuario(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s DBConn) buscarUsuario(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	rows, err := s.DB.Query(`SELECT
-		id, usuario, correo_electronico
-		FROM usuarios
-		WHERE usuario LIKE $1
-		AND correo_electronico LIKE $2`,
-
-		fmt.Sprintf("%%%s%%", q.Get("nombres")),
-		fmt.Sprintf("%%%s%%", q.Get("correo_electronico")))
-
-	defer rows.Close()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
 	var users []Usuario
 
-	for rows.Next() {
-		var user Usuario
-		rows.Scan(&user.ID, &user.UsuarioNombre, &user.CorreoElectronico)
-		users = append(users, user)
-	}
-	rows.Close()
+	ss := s.MDB.Copy()
+	defer ss.Close()
 
-	if len(users) == 0 {
-		http.Error(w, "No hay usuarios", http.StatusNotFound)
-		return
-	}
-
-	encoder := json.NewEncoder(w)
-	err = encoder.Encode(users)
+	err := ss.DB(dbName).C(usuariosC).Find(bson.M{}).All(&users)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
+	json.NewEncoder(w).Encode(users)
 }
 
 func (s DBConn) buscarPerfiles(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	rows, err := s.DB.Query(`SELECT
-		id, nombres, apellidos, documento_numero, fecha_nacimiento
-		FROM perfiles
-		WHERE nombres LIKE $1
-		AND apellidos LIKE $2`,
-
-		fmt.Sprintf("%%%s%%", q.Get("nombres")),
-		fmt.Sprintf("%%%s%%", q.Get("apellidos")))
-
-	defer rows.Close()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	ss := s.MDB.Copy()
+	defer ss.Close()
 
 	var prf []Perfil
 
-	for rows.Next() {
-		var p Perfil
-		rows.Scan(&p.ID, &p.Nombres, &p.Apellidos, &p.DocumentoNumero, &p.FechaNacimiento)
-		prf = append(prf, p)
+	nombres := bson.M{"$regex": q.Get("nombres"), "$options": "i"}
+	apellidos := bson.M{"$regex": q.Get("apellidos"), "$options": "i"}
+	documento := bson.M{"$regex": q.Get("documento"), "$options": "i"}
+	query := bson.M{"nombres": nombres, "apellidos": apellidos, "documentoNumero": documento}
+
+	err := ss.DB("mednote").C("perfiles").Find(query).All(&prf)
+
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
 	}
-	rows.Close()
 
 	if len(prf) == 0 {
-		http.Error(w, "No hay usuarios", http.StatusNotFound)
-		return
+		w.WriteHeader(http.StatusNotFound)
 	}
 
 	encoder := json.NewEncoder(w)
@@ -242,35 +191,29 @@ func (s DBConn) buscarPerfiles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s DBConn) actualizarUsuario(w http.ResponseWriter, r *http.Request) {
-	sqlStmt := `UPDATE usuarios
-		SET correo_electronico = $1
-		WHERE id = $2`
-
-	var req map[string]string
-	err := json.NewDecoder(r.Body).Decode(&req)
+	ss := s.MDB.Copy()
+	defer ss.Close()
 
 	vars := mux.Vars(r)
+	var usr Usuario
+	err := json.NewDecoder(r.Body).Decode(&usr)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
-	stmt, err := s.DB.Prepare(sqlStmt)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if !bson.IsObjectIdHex(vars["id"]) {
+		http.Error(w, "Id should be a valid Hex", http.StatusBadRequest)
 		return
 	}
-	res, err := stmt.Exec(req["correoElectronico"], vars["id"])
-	fmt.Print(vars["id"])
+
+	err = ss.DB(dbName).C(usuariosC).
+		UpdateId(bson.ObjectIdHex(vars["id"]), bson.M{"correoElectronico": usr.CorreoElectronico})
+
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	rows, err := res.RowsAffected()
-	if rows > 1 {
-		panic("This should not happen")
-	}
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	fmt.Fprint(w, "success", rows)
 }
 
 func activateCors(f http.HandlerFunc) http.HandlerFunc {
@@ -308,20 +251,86 @@ func validateToken(token string) bool {
 
 func createToken(username, authLevel string) (string, error) {
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
-		"usuario": username,
-		"grupo":   authLevel,
+		"username": username,
+		"grupo":    authLevel,
 	})
 
 	return token.SignedString(secretKey)
 }
 
-func main() {
+func (db DBConn) historias(w http.ResponseWriter, r *http.Request) {
+	var hus []HistoriaUrgencias
 
-	dbConn := NewDBConn()
-	defer dbConn.DB.Close()
-	r := Router(dbConn)
-	http.ListenAndServe(":8070", r)
+	ss := db.MDB.Copy()
+	defer ss.Close()
 
+	err := ss.DB("mednote").C("historiaUrgencias").Find(bson.M{}).All(&hus)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	encoder := json.NewEncoder(w)
+	encoder.Encode(hus)
+}
+
+func (db DBConn) crearHistoria(w http.ResponseWriter, r *http.Request) {
+
+	var hus HistoriaUrgencias
+
+	err := json.NewDecoder(r.Body).Decode(&hus)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	ss := db.MDB.Copy()
+	defer ss.Close()
+
+	hus.FechaFinalizacion = time.Now()
+	err = hus.Save(ss)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	encoder := json.NewEncoder(w)
+	encoder.Encode(hus.ID)
+}
+
+func (db DBConn) crearPerfil(w http.ResponseWriter, r *http.Request) {
+	var p Perfil
+	decoder := json.NewDecoder(r.Body)
+	err := decoder.Decode(&p)
+
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	err = p.Save(db.MDB)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+}
+
+func (db DBConn) obtenerPerfil(w http.ResponseWriter, r *http.Request) {
+	var p Perfil
+	ss := db.MDB.Copy()
+	defer ss.Close()
+	vars := mux.Vars(r)
+
+	if len(vars["id"]) != 24 {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	err := p.ObtenerPorID(ss, vars["id"])
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	json.NewEncoder(w).Encode(&p)
 }
 
 // Router es la funcion que crea un manejador, necesario para las pruebas
@@ -344,7 +353,28 @@ func Router(dbConn DBConn) *mux.Router {
 	w.HandleFunc("/usuarios/{id}", activateCors(dbConn.actualizarUsuario)).
 		Methods(http.MethodPut, http.MethodOptions)
 
+	w.HandleFunc("/perfiles/{id}", activateCors(dbConn.obtenerPerfil)).
+		Methods(http.MethodGet, http.MethodOptions)
+
 	w.HandleFunc("/perfiles", activateCors(dbConn.buscarPerfiles)).
 		Methods(http.MethodGet, http.MethodOptions)
+
+	w.HandleFunc("/perfiles", activateCors(dbConn.crearPerfil)).
+		Methods(http.MethodPost, http.MethodOptions)
+
+	w.HandleFunc("/historia", activateCors(dbConn.historias)).
+		Methods(http.MethodGet, http.MethodOptions)
+
+	w.HandleFunc("/historia", activateCors(dbConn.crearHistoria)).
+		Methods(http.MethodPost, http.MethodOptions)
 	return w
+}
+
+func main() {
+
+	dbConn := NewDBConn()
+	defer dbConn.MDB.Close()
+	r := Router(dbConn)
+	http.ListenAndServe(":8070", r)
+
 }

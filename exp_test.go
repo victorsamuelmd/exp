@@ -8,11 +8,14 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/globalsign/mgo/bson"
 )
 
+var db = NewDBConn()
+
 func TestUsuarios(t *testing.T) {
-	db := NewDBConn()
-	defer db.DB.Close()
 
 	srv := httptest.NewServer(Router(db))
 	defer srv.Close()
@@ -42,6 +45,7 @@ func TestUsuarios(t *testing.T) {
 			st.Fatal(err)
 		}
 		err = json.NewDecoder(res.Body).Decode(&id)
+		fmt.Println("ID ", id)
 		if err != nil {
 			st.Fatal(err)
 		}
@@ -97,7 +101,7 @@ func TestUsuarios(t *testing.T) {
 		}
 	})
 
-	db.DB.Exec("delete from usuarios where id = $1", id)
+	db.MDB.DB(dbName).C(perfilesC).RemoveId(id)
 }
 
 func TestBuscarUsuario(t *testing.T) {
@@ -107,13 +111,56 @@ func TestBuscarUsuario(t *testing.T) {
 		return
 	}
 
-	s := NewDBConn()
-	defer s.DB.Close()
 	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(s.buscarUsuario)
+	handler := http.HandlerFunc(db.buscarUsuario)
 	handler.ServeHTTP(rr, req)
 	if status := rr.Code; status != http.StatusOK {
 		t.Errorf("handler returned wrong status code: got %v want %v: %v",
 			status, http.StatusOK, rr.Body)
 	}
+}
+
+func TestSaveHistoriaUrgencias(t *testing.T) {
+
+	var hu = HistoriaUrgencias{
+		Medico:            "b867de22-f938-4211-9754-a47a84ea2bf6",
+		Paciente:          bson.NewObjectId(),
+		Peso:              65.5,
+		Talla:             1.65,
+		FechaInicio:       time.Now().Add(-10 * time.Minute),
+		FechaFinalizacion: time.Now(),
+	}
+
+	err := hu.Save(db.MDB)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+}
+
+func TestSavePerfil(t *testing.T) {
+
+	var p = Perfil{
+		Nombres:         "Natalia",
+		Apellidos:       "Ramirez Orozco",
+		DocumentoNumero: "1087998476",
+		DocumentoTipo:   "CC",
+		Genero:          "F",
+	}
+	err := p.Save(db.MDB.Copy())
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+}
+
+func TestObtenerPerfilPorID(t *testing.T) {
+
+	var p Perfil
+	err := p.ObtenerPorID(db.MDB.Copy(), "5b63656adb437400095a7068")
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+}
+
+func TestObtenerHistoriaUrgencias(t *testing.T) {
+
 }
